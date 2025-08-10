@@ -77,7 +77,7 @@ print("Testing systematic range from 1e-10 to 1e10...")
 
 # Create logarithmic range
 exponents = np.arange(-10, 11, 1)  # -10 to 10
-test_values = torch.tensor([10.0**exp for exp in exponents], device=device)
+test_values = torch.tensor([10.0**exp for exp in exponents], dtype=torch.float32, device=device)
 
 print(f"Original exponents: {exponents}")
 print(f"Original values: {test_values.cpu().numpy()}")
