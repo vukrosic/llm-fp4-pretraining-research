@@ -30,32 +30,27 @@ class FP4Linear(nn.Module):
         return torch.matmul(x, weight.t()) + self.bias
 
 class FP4Net(nn.Module):
-    def __init__(self, input_size=2, hidden_size=128, output_size=1):
+    def __init__(self, input_size=2, hidden_size=32, output_size=1):
         super().__init__()
         self.fc1 = FP4Linear(input_size, hidden_size)
         self.fc2 = FP4Linear(hidden_size, hidden_size)
-        self.fc3 = FP4Linear(hidden_size, hidden_size)
-        self.fc4 = FP4Linear(hidden_size, output_size)
-        self.dropout = nn.Dropout(0.1)
+        self.fc3 = FP4Linear(hidden_size, output_size)
     
     def forward(self, x):
         x = torch.relu(self.fc1(x))
-        x = self.dropout(x)
         x = torch.relu(self.fc2(x))
-        x = self.dropout(x)
-        x = torch.relu(self.fc3(x))
-        x = torch.sigmoid(self.fc4(x))  # Sigmoid to keep output in [0,1]
+        x = torch.sigmoid(self.fc3(x))  # Sigmoid to keep output in [0,1]
         return x
 
-def generate_arithmetic_data(batch_size, max_val=50):
-    """Generate data for learning: (a, b) -> (a + b) % 10 (last digit of sum)"""
-    a = torch.randint(0, max_val, (batch_size,), dtype=torch.float32)
-    b = torch.randint(0, max_val, (batch_size,), dtype=torch.float32)
+def generate_simple_sum_data(batch_size):
+    """Generate data for learning simple addition: (a, b) -> a + b where a,b in [1,5]"""
+    a = torch.randint(1, 6, (batch_size,), dtype=torch.float32)  # 1 to 5
+    b = torch.randint(1, 6, (batch_size,), dtype=torch.float32)  # 1 to 5
     
-    # Normalize inputs to [0, 1]
-    x = torch.stack([a / max_val, b / max_val], dim=1)
-    # Target is the last digit of the sum, normalized to [0, 1]
-    y = ((a + b) % 10) / 10.0
+    # Normalize inputs to [0, 1] (1->0.2, 5->1.0)
+    x = torch.stack([(a - 1) / 4, (b - 1) / 4], dim=1)
+    # Target is the sum, normalized (2->0.1, 10->1.0)
+    y = (a + b - 2) / 8.0
     
     return x, y
 
@@ -65,64 +60,30 @@ if not torch.cuda.is_available():
 
 device = 'cuda'
 print(f"Using device: {device}")
-model = FP4Net(input_size=2, hidden_size=128, output_size=1).to(device)
+model = FP4Net(input_size=2, hidden_size=32, output_size=1).to(device)
 
-# Don't quantize initially - let it learn first
-
-# Test forward pass
-test_x, test_y = generate_arithmetic_data(32)
-test_x, test_y = test_x.to(device), test_y.to(device)
-output = model(test_x)
-print(f"Output shape: {output.shape}")
-print(f"Sample input: {test_x[0].cpu().numpy()}")
-print(f"Expected output: {test_y[0].item():.4f}")
-print(f"Model output: {output[0].item():.4f}")
-
-# Training loop for arithmetic
-optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
-criterion = nn.MSELoss()
-
-print("\nTraining to learn last digit of sum: (a + b) % 10...")
-print("Phase 1: Training with FP32 weights...")
-
-# Phase 1: Train with FP32 weights first
-for epoch in range(300):
-    # Generate training data
-    x, y = generate_arithmetic_data(512)
-    x, y = x.to(device), y.to(device)
-    
-    # Forward
-    output = model(x)
-    loss = criterion(output.squeeze(), y)
-    
-    # Backward
-    optimizer.zero_grad()
-    loss.backward()
-    optimizer.step()
-    
-    if epoch % 50 == 0:
-        # Calculate actual accuracy
-        with torch.no_grad():
-            test_x, test_y = generate_arithmetic_data(100)
-            test_x, test_y = test_x.to(device), test_y.to(device)
-            test_pred = model(test_x).squeeze() * 10
-            test_actual = test_y * 10
-            accuracy = (torch.abs(test_pred - test_actual) < 0.5).float().mean()
-        print(f"Epoch {epoch}, Loss: {loss.item():.6f}, Accuracy: {accuracy:.3f}")
-
-print("\nPhase 2: Fine-tuning with FP4 quantization...")
-# Phase 2: Now apply quantization and fine-tune
+# Quantize weights immediately for FP4-only training
 model.fc1.quantize_weights()
 model.fc2.quantize_weights()
 model.fc3.quantize_weights()
-model.fc4.quantize_weights()
 
-# Reduce learning rate for fine-tuning
-optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+# Test forward pass
+test_x, test_y = generate_simple_sum_data(32)
+test_x, test_y = test_x.to(device), test_y.to(device)
+output = model(test_x)
+print(f"Output shape: {output.shape}")
+print(f"Sample input: {test_x[0].cpu().numpy()} -> numbers: {test_x[0].cpu().numpy() * 4 + 1}")
+print(f"Expected output: {test_y[0].item():.4f} -> sum: {test_y[0].item() * 8 + 2:.1f}")
+print(f"Model output: {output[0].item():.4f} -> predicted sum: {output[0].item() * 8 + 2:.1f}")
 
-for epoch in range(200):
+# Training loop for simple addition
+optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+criterion = nn.MSELoss()
+
+print("\nTraining to learn simple addition (1-5 + 1-5) with FP4 weights...")
+for epoch in range(500):
     # Generate training data
-    x, y = generate_arithmetic_data(512)
+    x, y = generate_simple_sum_data(128)
     x, y = x.to(device), y.to(device)
     
     # Forward
@@ -134,52 +95,41 @@ for epoch in range(200):
     loss.backward()
     optimizer.step()
     
-    # Re-quantize weights less frequently
-    if epoch % 20 == 0:
+    # Re-quantize weights every 10 epochs
+    if epoch % 10 == 0:
         model.fc1.quantize_weights()
         model.fc2.quantize_weights()
         model.fc3.quantize_weights()
-        model.fc4.quantize_weights()
     
-    if epoch % 50 == 0:
-        # Calculate actual accuracy
+    if epoch % 100 == 0:
+        # Calculate actual accuracy on denormalized values
         with torch.no_grad():
-            test_x, test_y = generate_arithmetic_data(100)
+            test_x, test_y = generate_simple_sum_data(100)
             test_x, test_y = test_x.to(device), test_y.to(device)
-            test_pred = model(test_x).squeeze() * 10
-            test_actual = test_y * 10
+            test_pred = model(test_x).squeeze() * 8 + 2  # Denormalize to [2,10]
+            test_actual = test_y * 8 + 2
             accuracy = (torch.abs(test_pred - test_actual) < 0.5).float().mean()
         print(f"Epoch {epoch}, Loss: {loss.item():.6f}, Accuracy: {accuracy:.3f}")
 
-# Test the trained model
-print("\nTesting trained model:")
-test_cases = [
-    (17, 5),   # (17 + 5) % 10 = 2
-    (23, 7),   # (23 + 7) % 10 = 0
-    (15, 18),  # (15 + 18) % 10 = 3
-    (49, 26),  # (49 + 26) % 10 = 5
-    (8, 9),    # (8 + 9) % 10 = 7
-]
-
+# Test the trained model on all possible combinations
+print("\nTesting trained model on all possible sums (1-5 + 1-5):")
 model.eval()
 with torch.no_grad():
-    for a, b in test_cases:
-        # Normalize input
-        x = torch.tensor([[a/50, b/50]], device=device)
-        pred = model(x).item() * 10  # Denormalize output
-        actual = (a + b) % 10
-        print(f"({a} + {b}) % 10 = {actual}, Model prediction: {pred:.1f}, Error: {abs(pred - actual):.1f}")
-
-# Additional test with random cases
-print("\nRandom test cases:")
-with torch.no_grad():
-    test_x, test_y = generate_arithmetic_data(10)
-    test_x, test_y = test_x.to(device), test_y.to(device)
-    predictions = model(test_x).squeeze() * 10
+    all_correct = 0
+    total_tests = 0
     
-    for i in range(10):
-        a = int(test_x[i, 0].item() * 50)
-        b = int(test_x[i, 1].item() * 50)
-        actual = (a + b) % 10
-        pred = predictions[i].item()
-        print(f"({a} + {b}) % 10 = {actual}, Prediction: {pred:.1f}, Error: {abs(pred - actual):.1f}")
+    for a in range(1, 6):
+        for b in range(1, 6):
+            # Normalize input
+            x = torch.tensor([[(a-1)/4, (b-1)/4]], device=device)
+            pred = model(x).item() * 8 + 2  # Denormalize output
+            actual = a + b
+            error = abs(pred - actual)
+            is_correct = error < 0.5
+            all_correct += is_correct
+            total_tests += 1
+            
+            status = "✓" if is_correct else "✗"
+            print(f"{a} + {b} = {actual}, Prediction: {pred:.1f}, Error: {error:.1f} {status}")
+    
+    print(f"\nOverall Accuracy: {all_correct}/{total_tests} = {all_correct/total_tests:.1%}")
