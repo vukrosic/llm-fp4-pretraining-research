@@ -9,9 +9,10 @@ print("=" * 50)
 # Create neural network-like weight distribution (normal distribution)
 torch.manual_seed(42)
 n_weights = 50
-original_values = torch.randn(n_weights, dtype=torch.float32, device='cuda') * 0.5
+original_values = torch.randn(n_weights, dtype=torch.float32, device='cuda')
 
 print("1. Original float32 values (neural network weights):")
+print(f"   Values: {original_values}")
 print(f"   Shape: {original_values.shape}")
 print(f"   Range: [{original_values.min():.4f}, {original_values.max():.4f}]")
 print(f"   Mean: {original_values.mean():.4f}, Std: {original_values.std():.4f}")
