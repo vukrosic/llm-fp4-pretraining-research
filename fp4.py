@@ -22,8 +22,11 @@ class FP4Linear(nn.Module):
         self.quantized_weight, self.quant_state = bnb.quantize_fp4(self.weight.data)
     
     def forward(self, x):
-        # Dequantize and compute
-        weight = bnb.dequantize_fp4(self.quantized_weight, self.quant_state)
+        # Use quantized weights if available, otherwise use FP32 weights
+        if self.quantized_weight is not None:
+            weight = bnb.dequantize_fp4(self.quantized_weight, self.quant_state)
+        else:
+            weight = self.weight
         return torch.matmul(x, weight.t()) + self.bias
 
 class FP4Net(nn.Module):
