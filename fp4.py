@@ -104,7 +104,7 @@ for epoch in range(1000):
     
     # Forward pass
     output = model(x).squeeze()
-    loss = criterion(output, y.float())
+    loss = criterion(output, y.to(torch.bfloat16))
     
     # Backward pass
     optimizer.zero_grad()
@@ -123,7 +123,7 @@ for epoch in range(1000):
             test_pred = model(test_x).squeeze()
             # Round predictions to nearest integer
             test_pred_rounded = torch.round(test_pred)
-            accuracy = (test_pred_rounded == test_y.float()).float().mean()
+            accuracy = (test_pred_rounded == test_y.to(torch.bfloat16)).float().mean()
             
             if accuracy > best_accuracy:
                 best_accuracy = accuracy
