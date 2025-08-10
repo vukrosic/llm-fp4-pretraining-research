@@ -1,212 +1,147 @@
 import torch
 import torch.nn as nn
-import bitsandbytes.functional as bnb
+# Import the bitsandbytes library, specifically its neural network modules
+import bitsandbytes.optim as bnb_optim
+import bitsandbytes.nn as bnb_nn
 
-# Mixed Precision FP4 Neural Network
-class FP4Linear(nn.Module):
-    def __init__(self, in_features, out_features):
-        super().__init__()
-        # Initialize weights in BF16 for better precision during training
-        self.weight = nn.Parameter(torch.randn(out_features, in_features, dtype=torch.bfloat16) * 0.1)
-        self.bias = nn.Parameter(torch.zeros(out_features, dtype=torch.bfloat16))
-        
-        # Store FP4 quantized version for inference
-        self.quantized_weight = None
-        self.quant_state = None
-        
-    def quantize_weights(self):
-        """Quantize weights to FP4 for storage/inference"""
-        if not self.weight.is_cuda:
-            raise RuntimeError("Weights must be on CUDA device for FP4 quantization")
-        # Convert to FP32 for quantization (bitsandbytes requirement)
-        self.quantized_weight, self.quant_state = bnb.quantize_fp4(self.weight.data.float())
-    
-    def forward(self, x):
-        # Always use full precision weights during training
-        # Only use quantized weights during inference if explicitly set
-        if self.training:
-            # Use BF16 weights during training
-            return torch.matmul(x, self.weight.t()) + self.bias
-        else:
-            # During inference, can optionally use quantized weights
-            if self.quantized_weight is not None:
-                weight = bnb.dequantize_fp4(self.quantized_weight, self.quant_state).to(x.dtype)
-            else:
-                weight = self.weight
-            return torch.matmul(x, weight.t()) + self.bias
-
-class MixedPrecisionNet(nn.Module):
-    def __init__(self, input_size=2, hidden_size=64, output_size=1):
-        super().__init__()
-        # Use larger hidden size for better capacity with quantization
-        self.fc1 = FP4Linear(input_size, hidden_size)
-        self.fc2 = FP4Linear(hidden_size, hidden_size)
-        self.fc3 = FP4Linear(hidden_size, output_size)
-        
-        # Layer normalization to stabilize training
-        self.ln1 = nn.LayerNorm(hidden_size, dtype=torch.bfloat16)
-        self.ln2 = nn.LayerNorm(hidden_size, dtype=torch.bfloat16)
-    
-    def forward(self, x):
-        x = x.to(torch.bfloat16)
-        x = torch.relu(self.ln1(self.fc1(x)))
-        x = torch.relu(self.ln2(self.fc2(x)))
-        x = self.fc3(x)  # No sigmoid, use raw output
-        return x
-    
-    def quantize_all_weights(self):
-        """Quantize all layer weights to FP4 for inference"""
-        self.fc1.quantize_weights()
-        self.fc2.quantize_weights()
-        self.fc3.quantize_weights()
-
-def generate_simple_sum_data(batch_size, device='cuda'):
-    """Generate data for learning simple addition: (a, b) -> a + b where a,b in [1,5]"""
-    a = torch.randint(1, 6, (batch_size,), dtype=torch.float32, device=device)
-    b = torch.randint(1, 6, (batch_size,), dtype=torch.float32, device=device)
-    
-    # Keep inputs as raw values (1-5), don't normalize
-    x = torch.stack([a, b], dim=1)
-    # Target is the actual sum (2-10)
-    y = a + b
-    
-    return x, y
-
-# Create and test network
+# Ensure CUDA is available, as bitsandbytes is CUDA-only
 if not torch.cuda.is_available():
-    raise RuntimeError("CUDA is required for FP4 quantization")
+    raise RuntimeError("CUDA is required for bitsandbytes 4-bit quantization.")
+
+# Check for BFloat16 support, which is crucial for 4-bit training performance
+if not torch.cuda.is_bf16_supported():
+    raise RuntimeError("Your GPU does not support BFloat16, which is highly recommended for 4-bit training.")
 
 device = 'cuda'
 print(f"Using device: {device}")
 
-# Create model with mixed precision
-model = MixedPrecisionNet(input_size=2, hidden_size=64, output_size=1).to(device)
+# --- The "Real" 4-Bit Neural Network with FP4 ---
+class NetWith4BitLinear(nn.Module):
+    def __init__(self, input_size=2, hidden_size=64, output_size=1):
+        super().__init__()
+        
+        # Method 1: Using LinearFP4 directly (simpler syntax)
+        self.fc1 = bnb_nn.LinearFP4(
+            input_size,
+            hidden_size,
+            bias=True,
+            compute_dtype=torch.bfloat16,  # Perform matmul in BFloat16
+            compress_statistics=True,  # Compress statistics for memory efficiency
+            quant_storage=torch.uint8  # Storage type for quantized weights
+        )
+        
+        # Method 2: Using Linear4bit with quant_type='fp4' (equivalent to LinearFP4)
+        self.fc2 = bnb_nn.Linear4bit(
+            hidden_size,
+            hidden_size,
+            bias=True,
+            quant_type='fp4',  # Explicitly specify FP4 quantization
+            compute_dtype=torch.bfloat16,
+            compress_statistics=True,
+            quant_storage=torch.uint8
+        )
+        
+        # The final layer can be a standard linear layer or also a 4-bit one.
+        # Using FP4 for consistency
+        self.fc3 = bnb_nn.LinearFP4(
+            hidden_size,
+            output_size,
+            bias=True,
+            compute_dtype=torch.bfloat16,
+            compress_statistics=True
+        )
+    
+    def forward(self, x):
+        # The input should be cast to the compute dtype (BF16)
+        x = x.to(torch.bfloat16)
+        
+        x = torch.relu(self.fc1(x))
+        x = torch.relu(self.fc2(x))
+        x = self.fc3(x)
+        return x
 
-# Test forward pass
-test_x, test_y = generate_simple_sum_data(32, device)
-output = model(test_x)
-print(f"Output shape: {output.shape}")
-print(f"Sample input: {test_x[0].cpu().numpy()} -> sum: {test_y[0].item()}")
-print(f"Model output (before training): {output[0].item():.2f}")
+def generate_simple_sum_data(batch_size, device='cuda'):
+    """Generate data for learning simple addition: (a, b) -> a + b"""
+    a = torch.randint(1, 10, (batch_size, 1), dtype=torch.float32, device=device)
+    b = torch.randint(1, 10, (batch_size, 1), dtype=torch.float32, device=device)
+    x = torch.cat([a, b], dim=1)
+    y = a + b
+    return x, y
 
-# Training with BF16 weights
-optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.01)
+# --- Create and Initialize Model ---
+# First create the model with FP16/BF16 weights
+model = NetWith4BitLinear().to(device)
+
+# Optional: If you want to load pre-trained FP16/BF16 weights, do it before quantization
+# model.load_state_dict(pretrained_weights)
+
+# The quantization happens when we move the model to CUDA
+# This is when the FP16/BF16 weights get quantized to FP4
+print("Model created with FP4 quantization")
+
+# You can inspect a layer to see how it's different from a standard nn.Linear
+print("\nInspecting the FP4 linear layers:")
+print(f"FC1 (LinearFP4): {model.fc1}")
+print(f"FC2 (Linear4bit with fp4): {model.fc2}")
+print(f"FC3 (LinearFP4): {model.fc3}")
+print("\n")
+
+# Use a bitsandbytes optimizer (like AdamW8bit) which is optimized for this kind of training.
+# It correctly handles the FP32 master weights.
+optimizer = bnb_optim.AdamW8bit(model.parameters(), lr=0.01, betas=(0.9, 0.995))
 criterion = nn.MSELoss()
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=1000)
 
-print("\nTraining with BF16 weights...")
+print("Training with FP4 weight storage and BF16 computation...")
 model.train()
-best_accuracy = 0
 
-for epoch in range(1000):
-    # Generate training data
-    x, y = generate_simple_sum_data(256, device)
+for epoch in range(2001):
+    x, y = generate_simple_sum_data(256, device=device)
     
     # Forward pass
-    output = model(x).squeeze()
-    loss = criterion(output, y.to(torch.bfloat16))
+    output = model(x)
     
-    # Backward pass
+    # Loss must be calculated in FP32 for stability
+    loss = criterion(output.float(), y.float())
+    
+    # Backward pass and optimization
     optimizer.zero_grad()
     loss.backward()
-    
-    # Gradient clipping for stability
-    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-    
     optimizer.step()
-    scheduler.step()
     
-    if epoch % 100 == 0:
-        model.eval()
-        with torch.no_grad():
-            test_x, test_y = generate_simple_sum_data(500, device)
-            test_pred = model(test_x).squeeze()
-            # Round predictions to nearest integer
-            test_pred_rounded = torch.round(test_pred)
-            accuracy = (test_pred_rounded == test_y.to(torch.bfloat16)).float().mean()
-            
-            if accuracy > best_accuracy:
-                best_accuracy = accuracy
-        
-        print(f"Epoch {epoch}, Loss: {loss.item():.6f}, Accuracy: {accuracy:.3f}, Best: {best_accuracy:.3f}")
-        model.train()
+    if epoch % 200 == 0:
+        print(f"Epoch {epoch}, Loss: {loss.item():.4f}")
 
-print(f"\nBest training accuracy with BF16: {best_accuracy:.3f}")
-
-# Now quantize to FP4 and test
-print("\nQuantizing weights to FP4 for inference...")
+# --- Final Evaluation ---
+print("\n" + "="*50)
+print("Testing Final Model with FP4 4-Bit Layers")
+print("="*50)
 model.eval()
-model.quantize_all_weights()
-
-# Test both BF16 and FP4 inference
-print("\nTesting on all possible sums:")
-print("=" * 60)
-
 with torch.no_grad():
-    # Test with BF16 weights (before quantization effect)
-    model.fc1.quantized_weight = None
-    model.fc2.quantized_weight = None
-    model.fc3.quantized_weight = None
-    
-    bf16_correct = 0
-    total_tests = 0
-    
-    print("BF16 Inference Results:")
-    print("-" * 30)
-    for a in range(1, 6):
-        for b in range(1, 6):
-            x = torch.tensor([[a, b]], device=device, dtype=torch.float32)
-            pred = model(x).item()
+    correct = 0
+    total = 0
+    for a_val in range(1, 10):
+        for b_val in range(1, 10):
+            x_test = torch.tensor([[a_val, b_val]], device=device, dtype=torch.float32)
+            # The model internally handles the conversion to BF16
+            pred = model(x_test).item()
             pred_rounded = round(pred)
-            actual = a + b
-            error = abs(pred - actual)
-            is_correct = pred_rounded == actual
-            bf16_correct += is_correct
-            total_tests += 1
+            actual = a_val + b_val
             
-            if a <= 3 and b <= 3:  # Show subset of results
-                status = "✓" if is_correct else "✗"
-                print(f"{a} + {b} = {actual}, Pred: {pred:.2f} → {pred_rounded}, Error: {error:.2f} {status}")
-    
-    print(f"\nBF16 Accuracy: {bf16_correct}/{total_tests} = {bf16_correct/total_tests:.1%}")
-    
-    # Now test with FP4 quantized weights
-    model.quantize_all_weights()
-    
-    fp4_correct = 0
-    total_tests = 0
-    
-    print("\nFP4 Inference Results:")
-    print("-" * 30)
-    for a in range(1, 6):
-        for b in range(1, 6):
-            x = torch.tensor([[a, b]], device=device, dtype=torch.float32)
-            pred = model(x).item()
-            pred_rounded = round(pred)
-            actual = a + b
-            error = abs(pred - actual)
-            is_correct = pred_rounded == actual
-            fp4_correct += is_correct
-            total_tests += 1
+            if pred_rounded == actual:
+                correct += 1
+            total += 1
             
-            if a <= 3 and b <= 3:  # Show subset of results
-                status = "✓" if is_correct else "✗"
-                print(f"{a} + {b} = {actual}, Pred: {pred:.2f} → {pred_rounded}, Error: {error:.2f} {status}")
-    
-    print(f"\nFP4 Accuracy: {fp4_correct}/{total_tests} = {fp4_correct/total_tests:.1%}")
-    print(f"Accuracy drop from quantization: {(bf16_correct - fp4_correct)/total_tests:.1%}")
+            if a_val <= 4 and b_val <= 4:
+                status = "✓" if pred_rounded == actual else "✗"
+                print(f"{a_val} + {b_val} = {actual},  Pred: {pred:.2f} -> {pred_rounded}  {status}")
 
-# Memory comparison
-print("\n" + "=" * 60)
-print("Memory Usage Comparison:")
-print("-" * 30)
+    accuracy = 100 * correct / total
+    print(f"\nFinal Accuracy with FP4 quantization (rounded prediction): {accuracy:.2f}%")
 
-# Calculate parameter sizes
-total_params = sum(p.numel() for p in model.parameters())
-bf16_size = total_params * 2  # 2 bytes per BF16 parameter
-fp4_size = total_params * 0.5  # 0.5 bytes per FP4 parameter (4 bits)
-
-print(f"Total parameters: {total_params:,}")
-print(f"BF16 model size: {bf16_size / 1024:.2f} KB")
-print(f"FP4 model size: {fp4_size / 1024:.2f} KB")
-print(f"Compression ratio: {bf16_size / fp4_size:.1f}x")
+# Optional: Print memory usage comparison
+print("\n" + "="*50)
+print("Memory Efficiency Information")
+print("="*50)
+print("FP4 uses 4 bits per weight vs 32 bits for FP32 (8x reduction)")
+print("FP4 uses 4 bits per weight vs 16 bits for FP16 (4x reduction)")
+print("With compress_statistics=True, additional memory savings are achieved")
