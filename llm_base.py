@@ -15,6 +15,7 @@ from typing import List, Optional
 import warnings
 import os
 import pickle
+import json
 warnings.filterwarnings('ignore')
 
 # Fix tokenizer parallelism warning
@@ -38,7 +39,7 @@ class ModelConfig:
     n_layers: int = 6
     d_ff: int = 1536
     batch_size: int = 24
-    max_steps: int = 1000
+    max_steps: int = 5000
 
     # Training parameters
     gradient_accumulation_steps: int = 4
@@ -301,6 +302,22 @@ def setup_adamw_optimizer(model: nn.Module, config: ModelConfig):
 def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataLoader):
     """Train the model with AdamW optimizer"""
     print(f"\n🚀 Training Small model with AdamW optimizer")
+    
+    # Initialize metrics tracking
+    metrics_history = {
+        'model_type': 'baseline_bf16',
+        'config': {
+            'd_model': config.d_model,
+            'n_layers': config.n_layers,
+            'n_heads': config.n_heads,
+            'd_ff': config.d_ff,
+            'batch_size': config.batch_size,
+            'max_steps': config.max_steps,
+            'adamw_lr': config.adamw_lr,
+            'weight_decay': config.weight_decay
+        },
+        'checkpoints': []
+    }
 
     # Initialize model
     set_seed(42)
@@ -395,15 +412,31 @@ def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataL
                     'lr': f'{optimizer.param_groups[0]["lr"]:.2e}'
                 })
 
-            # Evaluation
-            if step % config.eval_every == 0 and step > 0:
+            # Evaluation and checkpoint saving
+            if step % 1000 == 0 and step > 0:
                 eval_metrics = evaluate_model(model, val_loader, config)
+                
+                # Save checkpoint metrics
+                checkpoint_data = {
+                    'step': step,
+                    'val_loss': eval_metrics['val_loss'],
+                    'val_accuracy': eval_metrics['val_accuracy'],
+                    'val_perplexity': eval_metrics['val_perplexity'],
+                    'learning_rate': optimizer.param_groups[0]['lr'],
+                    'training_time_elapsed': time.time() - start_time
+                }
+                metrics_history['checkpoints'].append(checkpoint_data)
+                
                 print(f"\nStep {step}: Val Loss: {eval_metrics['val_loss']:.4f}, "
                       f"Val Acc: {eval_metrics['val_accuracy']:.4f}, "
                       f"Val PPL: {eval_metrics['val_perplexity']:.2f}")
 
                 if eval_metrics['val_loss'] < best_val_loss:
                     best_val_loss = eval_metrics['val_loss']
+                
+                # Save metrics to JSON file
+                with open('baseline_training_metrics.json', 'w') as f:
+                    json.dump(metrics_history, f, indent=2)
 
             step += 1
             if step % 100 == 0:
@@ -418,6 +451,25 @@ def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataL
     final_eval = evaluate_model(model, val_loader, config)
     print(f"  📊 Final - Loss: {final_eval['val_loss']:.4f}, "
           f"Acc: {final_eval['val_accuracy']:.4f}, PPL: {final_eval['val_perplexity']:.2f}")
+
+    # Add final metrics to history
+    final_checkpoint = {
+        'step': config.max_steps,
+        'val_loss': final_eval['val_loss'],
+        'val_accuracy': final_eval['val_accuracy'],
+        'val_perplexity': final_eval['val_perplexity'],
+        'learning_rate': optimizer.param_groups[0]['lr'],
+        'training_time_elapsed': training_time,
+        'final': True
+    }
+    metrics_history['checkpoints'].append(final_checkpoint)
+    metrics_history['total_training_time'] = training_time
+    
+    # Save final metrics
+    with open('baseline_training_metrics.json', 'w') as f:
+        json.dump(metrics_history, f, indent=2)
+    
+    print(f"  💾 Training metrics saved to baseline_training_metrics.json")
 
     return model, final_eval
 

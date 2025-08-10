@@ -105,6 +105,38 @@ def extract_metrics(output):
     
     return metrics
 
+def print_checkpoint_comparison(baseline_detailed, fp4_detailed):
+    """Print comparison of training checkpoints"""
+    print(f"\n{'='*80}")
+    print("📈 TRAINING PROGRESS COMPARISON")
+    print(f"{'='*80}")
+    
+    baseline_checkpoints = baseline_detailed.get('checkpoints', [])
+    fp4_checkpoints = fp4_detailed.get('checkpoints', [])
+    
+    if not baseline_checkpoints or not fp4_checkpoints:
+        print("❌ No checkpoint data available for comparison")
+        return
+    
+    print(f"{'Step':<8} {'Baseline Loss':<15} {'FP4 Loss':<15} {'Loss Diff':<12} {'Baseline Acc':<15} {'FP4 Acc':<15} {'Acc Diff':<12}")
+    print("-" * 100)
+    
+    # Create a mapping of steps for comparison
+    baseline_by_step = {cp['step']: cp for cp in baseline_checkpoints}
+    fp4_by_step = {cp['step']: cp for cp in fp4_checkpoints}
+    
+    common_steps = sorted(set(baseline_by_step.keys()) & set(fp4_by_step.keys()))
+    
+    for step in common_steps:
+        base_cp = baseline_by_step[step]
+        fp4_cp = fp4_by_step[step]
+        
+        loss_diff = fp4_cp['val_loss'] - base_cp['val_loss']
+        acc_diff = fp4_cp['val_accuracy'] - base_cp['val_accuracy']
+        
+        print(f"{step:<8} {base_cp['val_loss']:<15.4f} {fp4_cp['val_loss']:<15.4f} {loss_diff:<+12.4f} "
+              f"{base_cp['val_accuracy']:<15.4f} {fp4_cp['val_accuracy']:<15.4f} {acc_diff:<+12.4f}")
+
 def print_comparison(base_metrics, fp4_metrics):
     """Print a detailed comparison of the results"""
     print(f"\n{'='*80}")
@@ -229,10 +261,28 @@ def main():
     # Print comparison
     print_comparison(base_metrics, fp4_metrics)
     
+    # Load detailed training metrics if available
+    baseline_detailed = None
+    fp4_detailed = None
+    
+    try:
+        with open('baseline_training_metrics.json', 'r') as f:
+            baseline_detailed = json.load(f)
+    except FileNotFoundError:
+        pass
+    
+    try:
+        with open('fp4_training_metrics.json', 'r') as f:
+            fp4_detailed = json.load(f)
+    except FileNotFoundError:
+        pass
+    
     # Save results to JSON
     results = {
         'baseline': base_metrics,
         'fp4': fp4_metrics,
+        'baseline_detailed': baseline_detailed,
+        'fp4_detailed': fp4_detailed,
         'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
     }
     
@@ -240,6 +290,10 @@ def main():
         json.dump(results, f, indent=2)
     
     print(f"\n💾 Results saved to comparison_results.json")
+    
+    # Print checkpoint comparison if detailed metrics are available
+    if baseline_detailed and fp4_detailed:
+        print_checkpoint_comparison(baseline_detailed, fp4_detailed)
 
 if __name__ == "__main__":
     main()
