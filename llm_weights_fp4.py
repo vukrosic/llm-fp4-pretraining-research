@@ -18,6 +18,9 @@ import os
 import pickle
 warnings.filterwarnings('ignore')
 
+# Fix tokenizer parallelism warning
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 def set_seed(seed: int = 42):
     """Set all random seeds for reproducibility"""
     random.seed(seed)
@@ -383,31 +386,27 @@ def evaluate_model(model: nn.Module, val_loader: DataLoader, config: ModelConfig
     model.train()
     return {'val_loss': avg_loss, 'val_accuracy': accuracy, 'val_perplexity': perplexity}
 
-def setup_muon_optimizer(model: nn.Module, config: ModelConfig):
-    """Setup Muon optimizer with hybrid approach"""
-    muon_params = []
-    adamw_params = []
+def setup_adamw_optimizer(model: nn.Module, config: ModelConfig):
+    """Setup AdamW optimizer for all parameters"""
+    all_params = [p for p in model.parameters() if p.requires_grad]
+    
+    # Use the lower learning rate (originally for AdamW params) for all parameters
+    adamw_lr = config.muon_lr * 0.1
+    
+    print(f"  Total parameters: {sum(p.numel() for p in all_params):,}")
+    print(f"  Using AdamW with lr={adamw_lr:.4f} for all parameters")
 
-    for name, param in model.named_parameters():
-        if (param.ndim == 2 and 
-            'token_embedding' not in name and 
-            'norm' not in name and 
-            param.requires_grad):
-            muon_params.append(param)
-        else:
-            adamw_params.append(param)
-
-    print(f"  Muon parameters: {sum(p.numel() for p in muon_params):,}")
-    print(f"  AdamW parameters: {sum(p.numel() for p in adamw_params):,}")
-
-    muon_optimizer = Muon(muon_params, lr=config.muon_lr, momentum=0.95)
-    adamw_optimizer = torch.optim.AdamW(adamw_params, lr=config.muon_lr*0.1, weight_decay=config.weight_decay)
-
-    return [muon_optimizer, adamw_optimizer]
+    optimizer = torch.optim.AdamW(
+        all_params, 
+        lr=adamw_lr, 
+        weight_decay=config.weight_decay
+    )
+    
+    return optimizer
 
 def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataLoader):
-    """Train the model with Muon optimizer and FP4 weights"""
-    print(f"\n🚀 Training Small model with Muon optimizer and FP4 weights")
+    """Train the model with AdamW optimizer and FP4 weights"""
+    print(f"\n🚀 Training Small model with AdamW optimizer and FP4 weights")
 
     # Initialize model
     set_seed(42)
@@ -425,22 +424,19 @@ def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataL
     print(f"  🔢 FP32 parameters: {fp32_params:,} ({fp32_params/total_params*100:.1f}%)")
     print(f"  💾 Estimated memory savings: ~{(fp4_params * 3 / 4) / total_params * 100:.1f}%")
 
-    # Setup optimizers
-    optimizers = setup_muon_optimizer(model, config)
+    # Setup optimizer
+    optimizer = setup_adamw_optimizer(model, config)
 
     # Learning rate schedule
-    schedulers = []
-    for optimizer in optimizers:
-        warmup_steps = config.max_steps // 20
-        def lr_lambda(step):
-            if step < warmup_steps:
-                return step / warmup_steps
-            else:
-                progress = (step - warmup_steps) / (config.max_steps - warmup_steps)
-                return 0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * progress))
+    warmup_steps = config.max_steps // 20
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return step / warmup_steps
+        else:
+            progress = (step - warmup_steps) / (config.max_steps - warmup_steps)
+            return 0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * progress))
 
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-        schedulers.append(scheduler)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     scaler = GradScaler() if config.use_amp else None
 
@@ -475,23 +471,27 @@ def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataL
             # Optimizer step after accumulation
             if (step + 1) % config.gradient_accumulation_steps == 0:
                 if config.use_amp:
-                    for optimizer in optimizers:
-                        scaler.unscale_(optimizer)
+                    # Unscale gradients
+                    scaler.unscale_(optimizer)
+                    
+                    # Clip gradients
                     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
 
-                    for optimizer in optimizers:
-                        scaler.step(optimizer)
-                        optimizer.zero_grad()
-                    for scheduler in schedulers:
-                        scheduler.step()
+                    # Step optimizer and clear gradients
+                    scaler.step(optimizer)
+                    optimizer.zero_grad()
+                    
+                    # Update scheduler
+                    scheduler.step()
+                    
+                    # Update scaler
                     scaler.update()
                 else:
+                    # Standard training without AMP
                     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
-                    for optimizer in optimizers:
-                        optimizer.step()
-                        optimizer.zero_grad()
-                    for scheduler in schedulers:
-                        scheduler.step()
+                    optimizer.step()
+                    optimizer.zero_grad()
+                    scheduler.step()
 
             # Logging
             if step % 100 == 0:
@@ -505,7 +505,7 @@ def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataL
                     'loss': f'{current_loss:.4f}',
                     'acc': f'{accuracy:.3f}',
                     'ppl': f'{perplexity:.1f}',
-                    'lr': f'{optimizers[0].param_groups[0]["lr"]:.2e}'
+                    'lr': f'{optimizer.param_groups[0]["lr"]:.2e}'
                 })
 
             # Evaluation
