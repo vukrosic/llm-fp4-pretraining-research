@@ -64,11 +64,7 @@ device = 'cuda'
 print(f"Using device: {device}")
 model = FP4Net(input_size=2, hidden_size=128, output_size=1).to(device)
 
-# Quantize weights after moving to GPU
-model.fc1.quantize_weights()
-model.fc2.quantize_weights()
-model.fc3.quantize_weights()
-model.fc4.quantize_weights()
+# Don't quantize initially - let it learn first
 
 # Test forward pass
 test_x, test_y = generate_arithmetic_data(32)
@@ -80,13 +76,16 @@ print(f"Expected output: {test_y[0].item():.4f}")
 print(f"Model output: {output[0].item():.4f}")
 
 # Training loop for arithmetic
-optimizer = torch.optim.Adam(model.parameters(), lr=0.003)
+optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
 criterion = nn.MSELoss()
 
 print("\nTraining to learn last digit of sum: (a + b) % 10...")
-for epoch in range(1500):
+print("Phase 1: Training with FP32 weights...")
+
+# Phase 1: Train with FP32 weights first
+for epoch in range(300):
     # Generate training data
-    x, y = generate_arithmetic_data(256)
+    x, y = generate_arithmetic_data(512)
     x, y = x.to(device), y.to(device)
     
     # Forward
@@ -98,15 +97,56 @@ for epoch in range(1500):
     loss.backward()
     optimizer.step()
     
-    # Re-quantize weights after update (less frequently to avoid overhead)
-    if epoch % 10 == 0:
+    if epoch % 50 == 0:
+        # Calculate actual accuracy
+        with torch.no_grad():
+            test_x, test_y = generate_arithmetic_data(100)
+            test_x, test_y = test_x.to(device), test_y.to(device)
+            test_pred = model(test_x).squeeze() * 10
+            test_actual = test_y * 10
+            accuracy = (torch.abs(test_pred - test_actual) < 0.5).float().mean()
+        print(f"Epoch {epoch}, Loss: {loss.item():.6f}, Accuracy: {accuracy:.3f}")
+
+print("\nPhase 2: Fine-tuning with FP4 quantization...")
+# Phase 2: Now apply quantization and fine-tune
+model.fc1.quantize_weights()
+model.fc2.quantize_weights()
+model.fc3.quantize_weights()
+model.fc4.quantize_weights()
+
+# Reduce learning rate for fine-tuning
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+for epoch in range(200):
+    # Generate training data
+    x, y = generate_arithmetic_data(512)
+    x, y = x.to(device), y.to(device)
+    
+    # Forward
+    output = model(x)
+    loss = criterion(output.squeeze(), y)
+    
+    # Backward
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+    
+    # Re-quantize weights less frequently
+    if epoch % 20 == 0:
         model.fc1.quantize_weights()
         model.fc2.quantize_weights()
         model.fc3.quantize_weights()
         model.fc4.quantize_weights()
     
-    if epoch % 100 == 0:
-        print(f"Epoch {epoch}, Loss: {loss.item():.6f}")
+    if epoch % 50 == 0:
+        # Calculate actual accuracy
+        with torch.no_grad():
+            test_x, test_y = generate_arithmetic_data(100)
+            test_x, test_y = test_x.to(device), test_y.to(device)
+            test_pred = model(test_x).squeeze() * 10
+            test_actual = test_y * 10
+            accuracy = (torch.abs(test_pred - test_actual) < 0.5).float().mean()
+        print(f"Epoch {epoch}, Loss: {loss.item():.6f}, Accuracy: {accuracy:.3f}")
 
 # Test the trained model
 print("\nTesting trained model:")
