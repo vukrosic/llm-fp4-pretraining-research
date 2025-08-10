@@ -27,27 +27,32 @@ class FP4Linear(nn.Module):
         return torch.matmul(x, weight.t()) + self.bias
 
 class FP4Net(nn.Module):
-    def __init__(self, input_size=2, hidden_size=64, output_size=1):
+    def __init__(self, input_size=2, hidden_size=128, output_size=1):
         super().__init__()
         self.fc1 = FP4Linear(input_size, hidden_size)
         self.fc2 = FP4Linear(hidden_size, hidden_size)
-        self.fc3 = FP4Linear(hidden_size, output_size)
+        self.fc3 = FP4Linear(hidden_size, hidden_size)
+        self.fc4 = FP4Linear(hidden_size, output_size)
+        self.dropout = nn.Dropout(0.1)
     
     def forward(self, x):
         x = torch.relu(self.fc1(x))
+        x = self.dropout(x)
         x = torch.relu(self.fc2(x))
-        x = self.fc3(x)
+        x = self.dropout(x)
+        x = torch.relu(self.fc3(x))
+        x = torch.sigmoid(self.fc4(x))  # Sigmoid to keep output in [0,1]
         return x
 
-def generate_mod_division_data(batch_size, max_val=100):
-    """Generate data for learning modular division: (a, b) -> a % b"""
-    # Avoid division by zero by ensuring b is at least 1
-    a = torch.randint(1, max_val, (batch_size,), dtype=torch.float32)
-    b = torch.randint(1, max_val, (batch_size,), dtype=torch.float32)
+def generate_arithmetic_data(batch_size, max_val=50):
+    """Generate data for learning: (a, b) -> (a + b) % 10 (last digit of sum)"""
+    a = torch.randint(0, max_val, (batch_size,), dtype=torch.float32)
+    b = torch.randint(0, max_val, (batch_size,), dtype=torch.float32)
     
-    # Normalize inputs to help with training
+    # Normalize inputs to [0, 1]
     x = torch.stack([a / max_val, b / max_val], dim=1)
-    y = (a % b) / max_val  # Normalize output too
+    # Target is the last digit of the sum, normalized to [0, 1]
+    y = ((a + b) % 10) / 10.0
     
     return x, y
 
@@ -57,15 +62,16 @@ if not torch.cuda.is_available():
 
 device = 'cuda'
 print(f"Using device: {device}")
-model = FP4Net(input_size=2, hidden_size=64, output_size=1).to(device)
+model = FP4Net(input_size=2, hidden_size=128, output_size=1).to(device)
 
 # Quantize weights after moving to GPU
 model.fc1.quantize_weights()
 model.fc2.quantize_weights()
 model.fc3.quantize_weights()
+model.fc4.quantize_weights()
 
 # Test forward pass
-test_x, test_y = generate_mod_division_data(32)
+test_x, test_y = generate_arithmetic_data(32)
 test_x, test_y = test_x.to(device), test_y.to(device)
 output = model(test_x)
 print(f"Output shape: {output.shape}")
@@ -73,14 +79,14 @@ print(f"Sample input: {test_x[0].cpu().numpy()}")
 print(f"Expected output: {test_y[0].item():.4f}")
 print(f"Model output: {output[0].item():.4f}")
 
-# Training loop for modular division
-optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+# Training loop for arithmetic
+optimizer = torch.optim.Adam(model.parameters(), lr=0.003)
 criterion = nn.MSELoss()
 
-print("\nTraining to learn modular division (a % b)...")
-for epoch in range(100):
+print("\nTraining to learn last digit of sum: (a + b) % 10...")
+for epoch in range(1500):
     # Generate training data
-    x, y = generate_mod_division_data(128)
+    x, y = generate_arithmetic_data(256)
     x, y = x.to(device), y.to(device)
     
     # Forward
@@ -92,28 +98,45 @@ for epoch in range(100):
     loss.backward()
     optimizer.step()
     
-    # Re-quantize weights after update
-    model.fc1.quantize_weights()
-    model.fc2.quantize_weights()
-    model.fc3.quantize_weights()
+    # Re-quantize weights after update (less frequently to avoid overhead)
+    if epoch % 10 == 0:
+        model.fc1.quantize_weights()
+        model.fc2.quantize_weights()
+        model.fc3.quantize_weights()
+        model.fc4.quantize_weights()
     
-    if epoch % 20 == 0:
+    if epoch % 100 == 0:
         print(f"Epoch {epoch}, Loss: {loss.item():.6f}")
 
 # Test the trained model
 print("\nTesting trained model:")
 test_cases = [
-    (17, 5),   # 17 % 5 = 2
-    (23, 7),   # 23 % 7 = 2  
-    (50, 13),  # 50 % 13 = 11
-    (99, 10),  # 99 % 10 = 9
+    (17, 5),   # (17 + 5) % 10 = 2
+    (23, 7),   # (23 + 7) % 10 = 0
+    (15, 18),  # (15 + 18) % 10 = 3
+    (49, 26),  # (49 + 26) % 10 = 5
+    (8, 9),    # (8 + 9) % 10 = 7
 ]
 
 model.eval()
 with torch.no_grad():
     for a, b in test_cases:
         # Normalize input
-        x = torch.tensor([[a/100, b/100]], device=device)
-        pred = model(x).item() * 100  # Denormalize output
-        actual = a % b
-        print(f"{a} % {b} = {actual}, Model prediction: {pred:.2f}, Error: {abs(pred - actual):.2f}")
+        x = torch.tensor([[a/50, b/50]], device=device)
+        pred = model(x).item() * 10  # Denormalize output
+        actual = (a + b) % 10
+        print(f"({a} + {b}) % 10 = {actual}, Model prediction: {pred:.1f}, Error: {abs(pred - actual):.1f}")
+
+# Additional test with random cases
+print("\nRandom test cases:")
+with torch.no_grad():
+    test_x, test_y = generate_arithmetic_data(10)
+    test_x, test_y = test_x.to(device), test_y.to(device)
+    predictions = model(test_x).squeeze() * 10
+    
+    for i in range(10):
+        a = int(test_x[i, 0].item() * 50)
+        b = int(test_x[i, 1].item() * 50)
+        actual = (a + b) % 10
+        pred = predictions[i].item()
+        print(f"({a} + {b}) % 10 = {actual}, Prediction: {pred:.1f}, Error: {abs(pred - actual):.1f}")
