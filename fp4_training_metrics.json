@@ -1,0 +1,62 @@
+{
+  "model_type": "fp4_quantized",
+  "config": {
+    "d_model": 384,
+    "n_layers": 6,
+    "n_heads": 8,
+    "d_ff": 1536,
+    "batch_size": 24,
+    "max_steps": 5000,
+    "adamw_lr": 0.001,
+    "weight_decay": 0.1
+  },
+  "checkpoints": [
+    {
+      "step": 1000,
+      "val_loss": 8.499862747192383,
+      "val_accuracy": 0.24091064453125,
+      "val_perplexity": 4914.094320767923,
+      "fp4_quantization_error": 0.0019310445722658187,
+      "learning_rate": 0.001,
+      "training_time_elapsed": 30.463329792022705
+    },
+    {
+      "step": 2000,
+      "val_loss": 7.704307198524475,
+      "val_accuracy": 0.24137044270833333,
+      "val_perplexity": 2217.880299132333,
+      "fp4_quantization_error": 0.0019310445722658187,
+      "learning_rate": 0.0009938625865312252,
+      "training_time_elapsed": 60.27997064590454
+    },
+    {
+      "step": 3000,
+      "val_loss": 7.372784748077392,
+      "val_accuracy": 0.24166097005208334,
+      "val_perplexity": 1592.0611047961625,
+      "fp4_quantization_error": 0.0019310445722658187,
+      "learning_rate": 0.0009756177587652855,
+      "training_time_elapsed": 90.08916640281677
+    },
+    {
+      "step": 4000,
+      "val_loss": 7.163293380737304,
+      "val_accuracy": 0.24085530598958332,
+      "val_perplexity": 1291.1562073984119,
+      "fp4_quantization_error": 0.0019310445722658187,
+      "learning_rate": 0.0009457631880429201,
+      "training_time_elapsed": 119.87644791603088
+    },
+    {
+      "step": 5000,
+      "val_loss": 6.997264885902405,
+      "val_accuracy": 0.24109293619791666,
+      "val_perplexity": 1093.637839753412,
+      "fp4_quantization_error": 0.0019310445722658187,
+      "learning_rate": 0.0009051132292283771,
+      "training_time_elapsed": 148.317396402359,
+      "final": true
+    }
+  ],
+  "total_training_time": 148.317396402359
+}
