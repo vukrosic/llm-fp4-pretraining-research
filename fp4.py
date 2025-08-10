@@ -27,16 +27,29 @@ class FP4Linear(nn.Module):
         return torch.matmul(x, weight.t()) + self.bias
 
 class FP4Net(nn.Module):
-    def __init__(self):
+    def __init__(self, input_size=2, hidden_size=64, output_size=1):
         super().__init__()
-        self.fc1 = FP4Linear(784, 128)
-        self.fc2 = FP4Linear(128, 10)
+        self.fc1 = FP4Linear(input_size, hidden_size)
+        self.fc2 = FP4Linear(hidden_size, hidden_size)
+        self.fc3 = FP4Linear(hidden_size, output_size)
     
     def forward(self, x):
-        x = x.view(-1, 784)
         x = torch.relu(self.fc1(x))
-        x = self.fc2(x)
+        x = torch.relu(self.fc2(x))
+        x = self.fc3(x)
         return x
+
+def generate_mod_division_data(batch_size, max_val=100):
+    """Generate data for learning modular division: (a, b) -> a % b"""
+    # Avoid division by zero by ensuring b is at least 1
+    a = torch.randint(1, max_val, (batch_size,), dtype=torch.float32)
+    b = torch.randint(1, max_val, (batch_size,), dtype=torch.float32)
+    
+    # Normalize inputs to help with training
+    x = torch.stack([a / max_val, b / max_val], dim=1)
+    y = (a % b) / max_val  # Normalize output too
+    
+    return x, y
 
 # Create and test network
 if not torch.cuda.is_available():
@@ -44,29 +57,35 @@ if not torch.cuda.is_available():
 
 device = 'cuda'
 print(f"Using device: {device}")
-model = FP4Net().to(device)
+model = FP4Net(input_size=2, hidden_size=64, output_size=1).to(device)
 
 # Quantize weights after moving to GPU
 model.fc1.quantize_weights()
 model.fc2.quantize_weights()
+model.fc3.quantize_weights()
 
 # Test forward pass
-batch = torch.randn(32, 784, device=device)
-output = model(batch)
+test_x, test_y = generate_mod_division_data(32)
+test_x, test_y = test_x.to(device), test_y.to(device)
+output = model(test_x)
 print(f"Output shape: {output.shape}")
+print(f"Sample input: {test_x[0].cpu().numpy()}")
+print(f"Expected output: {test_y[0].item():.4f}")
+print(f"Model output: {output[0].item():.4f}")
 
-# Training loop example
+# Training loop for modular division
 optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-criterion = nn.CrossEntropyLoss()
+criterion = nn.MSELoss()
 
-for epoch in range(5):
-    # Dummy data
-    x = torch.randn(32, 784, device=device)
-    y = torch.randint(0, 10, (32,), device=device)
+print("\nTraining to learn modular division (a % b)...")
+for epoch in range(100):
+    # Generate training data
+    x, y = generate_mod_division_data(128)
+    x, y = x.to(device), y.to(device)
     
     # Forward
     output = model(x)
-    loss = criterion(output, y)
+    loss = criterion(output.squeeze(), y)
     
     # Backward
     optimizer.zero_grad()
@@ -76,5 +95,25 @@ for epoch in range(5):
     # Re-quantize weights after update
     model.fc1.quantize_weights()
     model.fc2.quantize_weights()
+    model.fc3.quantize_weights()
     
-    print(f"Epoch {epoch}, Loss: {loss.item():.4f}")
+    if epoch % 20 == 0:
+        print(f"Epoch {epoch}, Loss: {loss.item():.6f}")
+
+# Test the trained model
+print("\nTesting trained model:")
+test_cases = [
+    (17, 5),   # 17 % 5 = 2
+    (23, 7),   # 23 % 7 = 2  
+    (50, 13),  # 50 % 13 = 11
+    (99, 10),  # 99 % 10 = 9
+]
+
+model.eval()
+with torch.no_grad():
+    for a, b in test_cases:
+        # Normalize input
+        x = torch.tensor([[a/100, b/100]], device=device)
+        pred = model(x).item() * 100  # Denormalize output
+        actual = a % b
+        print(f"{a} % {b} = {actual}, Model prediction: {pred:.2f}, Error: {abs(pred - actual):.2f}")
