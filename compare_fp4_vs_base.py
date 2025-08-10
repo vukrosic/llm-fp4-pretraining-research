@@ -120,7 +120,7 @@ def print_comparison(base_metrics, fp4_metrics):
         return
     
     print(f"\n🏆 PERFORMANCE METRICS:")
-    print(f"{'Metric':<25} {'Baseline (FP32)':<20} {'FP4 Quantized':<20} {'Difference':<15}")
+    print(f"{'Metric':<25} {'Baseline (BF16)':<20} {'FP4 Quantized':<20} {'Difference':<15}")
     print("-" * 80)
     
     # Validation Loss (lower is better)
@@ -221,7 +221,7 @@ def main():
     
     # Run baseline model
     print(f"\n🔄 Starting comparison...")
-    base_metrics = run_script("llm_base.py", "Baseline Model (FP32 + AdamW)")
+    base_metrics = run_script("llm_base.py", "Baseline Model (BF16 + AdamW)")
     
     # Run FP4 model
     fp4_metrics = run_script("llm_weights_fp4.py", "FP4 Quantized Model (FP4 + AdamW)")
