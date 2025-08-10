@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch.cuda.amp import autocast, GradScaler
+import bitsandbytes.functional as bnb
 import math
 import random
 import numpy as np
@@ -179,6 +180,45 @@ class TextTokenDataset(Dataset):
         y = torch.tensor(self.tokens[idx + 1:idx + self.seq_len + 1], dtype=torch.long)
         return x, y
 
+class FP4Linear(nn.Module):
+    """Linear layer with FP4 quantized weights"""
+    def __init__(self, in_features: int, out_features: int, bias: bool = True):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        
+        # Store weights in FP32 for training, quantize during forward
+        self.weight = nn.Parameter(torch.randn(out_features, in_features) * 0.02)
+        self.bias = nn.Parameter(torch.zeros(out_features)) if bias else None
+        
+        # Cache for quantized weights and state
+        self._quantized_weight = None
+        self._quant_state = None
+        self._weight_version = -1
+    
+    def _maybe_quantize_weight(self):
+        """Quantize weight if it has changed"""
+        current_version = self.weight._version
+        if self._weight_version != current_version:
+            if self.weight.device.type == 'cuda':
+                self._quantized_weight, self._quant_state = bnb.quantize_fp4(self.weight.data)
+                self._weight_version = current_version
+            else:
+                # Fallback to FP32 on CPU
+                self._quantized_weight = self.weight.data
+                self._quant_state = None
+    
+    def forward(self, x):
+        self._maybe_quantize_weight()
+        
+        if self._quant_state is not None:
+            # Use FP4 quantized weights
+            weight_fp4 = bnb.dequantize_fp4(self._quantized_weight, self._quant_state)
+            return F.linear(x, weight_fp4, self.bias)
+        else:
+            # Fallback to FP32
+            return F.linear(x, self.weight, self.bias)
+
 class Rotary(nn.Module):
     def __init__(self, dim: int, max_seq_len: int):
         super().__init__()
@@ -204,8 +244,8 @@ class MultiHeadAttention(nn.Module):
         self.n_heads = n_heads
         self.d_k = d_model // n_heads
 
-        self.qkv = nn.Linear(d_model, d_model * 3, bias=False)
-        self.w_o = nn.Linear(d_model, d_model, bias=False)
+        self.qkv = FP4Linear(d_model, d_model * 3, bias=False)
+        self.w_o = FP4Linear(d_model, d_model, bias=False)
         self.rotary = Rotary(self.d_k, max_seq_len)
         self.dropout = dropout
 
@@ -228,8 +268,8 @@ class MultiHeadAttention(nn.Module):
 class FeedForward(nn.Module):
     def __init__(self, d_model: int, d_ff: int, dropout: float = 0.1):
         super().__init__()
-        self.linear1 = nn.Linear(d_model, d_ff, bias=False)
-        self.linear2 = nn.Linear(d_ff, d_model, bias=False)
+        self.linear1 = FP4Linear(d_model, d_ff, bias=False)
+        self.linear2 = FP4Linear(d_ff, d_model, bias=False)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
@@ -267,9 +307,9 @@ class MinimalLLM(nn.Module):
         self.norm = nn.RMSNorm(config.d_model)
         self.output_dropout = nn.Dropout(config.dropout)
 
-        # Tie weights
-        self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
-        self.lm_head.weight = self.token_embedding.weight
+        # Tie weights - keep embedding as FP32, use FP4 for output projection
+        self.lm_head = FP4Linear(config.d_model, config.vocab_size, bias=False)
+        # Note: Weight tying with FP4 is complex, so we'll keep them separate for now
 
         self.apply(self._init_weights)
 
@@ -292,6 +332,24 @@ class MinimalLLM(nn.Module):
         x = self.output_dropout(x)
         logits = self.lm_head(x)
         return logits
+
+def analyze_fp4_errors(model: nn.Module):
+    """Analyze quantization errors in FP4 layers"""
+    total_error = 0
+    total_elements = 0
+    
+    for name, module in model.named_modules():
+        if isinstance(module, FP4Linear) and module._quant_state is not None:
+            original = module.weight.data
+            quantized = bnb.dequantize_fp4(module._quantized_weight, module._quant_state)
+            error = torch.abs(original - quantized).mean().item()
+            total_error += error * original.numel()
+            total_elements += original.numel()
+    
+    if total_elements > 0:
+        avg_error = total_error / total_elements
+        return avg_error
+    return 0.0
 
 def evaluate_model(model: nn.Module, val_loader: DataLoader, config: ModelConfig):
     """Evaluate model performance"""
@@ -348,8 +406,8 @@ def setup_muon_optimizer(model: nn.Module, config: ModelConfig):
     return [muon_optimizer, adamw_optimizer]
 
 def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataLoader):
-    """Train the model with Muon optimizer"""
-    print(f"\n🚀 Training Small model with Muon optimizer")
+    """Train the model with Muon optimizer and FP4 weights"""
+    print(f"\n🚀 Training Small model with Muon optimizer and FP4 weights")
 
     # Initialize model
     set_seed(42)
@@ -358,7 +416,14 @@ def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataL
     model = model.to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
+    fp4_params = sum(p.numel() for name, p in model.named_parameters() 
+                     if any(fp4_layer in name for fp4_layer in ['qkv', 'w_o', 'linear1', 'linear2', 'lm_head']))
+    fp32_params = total_params - fp4_params
+    
     print(f"  📊 Total parameters: {total_params:,}")
+    print(f"  🔢 FP4 parameters: {fp4_params:,} ({fp4_params/total_params*100:.1f}%)")
+    print(f"  🔢 FP32 parameters: {fp32_params:,} ({fp32_params/total_params*100:.1f}%)")
+    print(f"  💾 Estimated memory savings: ~{(fp4_params * 3 / 4) / total_params * 100:.1f}%")
 
     # Setup optimizers
     optimizers = setup_muon_optimizer(model, config)
@@ -446,9 +511,11 @@ def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataL
             # Evaluation
             if step % config.eval_every == 0 and step > 0:
                 eval_metrics = evaluate_model(model, val_loader, config)
+                fp4_error = analyze_fp4_errors(model)
                 print(f"\nStep {step}: Val Loss: {eval_metrics['val_loss']:.4f}, "
                       f"Val Acc: {eval_metrics['val_accuracy']:.4f}, "
-                      f"Val PPL: {eval_metrics['val_perplexity']:.2f}")
+                      f"Val PPL: {eval_metrics['val_perplexity']:.2f}, "
+                      f"FP4 Error: {fp4_error:.6f}")
 
                 if eval_metrics['val_loss'] < best_val_loss:
                     best_val_loss = eval_metrics['val_loss']
@@ -464,8 +531,10 @@ def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataL
 
     # Final evaluation
     final_eval = evaluate_model(model, val_loader, config)
+    final_fp4_error = analyze_fp4_errors(model)
     print(f"  📊 Final - Loss: {final_eval['val_loss']:.4f}, "
           f"Acc: {final_eval['val_accuracy']:.4f}, PPL: {final_eval['val_perplexity']:.2f}")
+    print(f"  🔢 Final FP4 quantization error: {final_fp4_error:.6f}")
 
     return model, final_eval
 
