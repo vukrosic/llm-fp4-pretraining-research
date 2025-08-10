@@ -10,12 +10,14 @@ class FP4Linear(nn.Module):
         self.weight = nn.Parameter(torch.randn(out_features, in_features) * 0.1)
         self.bias = nn.Parameter(torch.zeros(out_features))
         
-        # Quantize to FP4
+        # Quantize to FP4 - will be done after moving to GPU
         self.quantized_weight = None
         self.quant_state = None
-        self.quantize_weights()
     
     def quantize_weights(self):
+        # Ensure weights are on GPU before quantization
+        if not self.weight.is_cuda:
+            raise RuntimeError("Weights must be on CUDA device for FP4 quantization")
         # Quantize weights to FP4 using bitsandbytes
         self.quantized_weight, self.quant_state = bnb.quantize_fp4(self.weight.data)
     
@@ -37,8 +39,16 @@ class FP4Net(nn.Module):
         return x
 
 # Create and test network
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
+if not torch.cuda.is_available():
+    raise RuntimeError("CUDA is required for FP4 quantization. CPU only supports NF4.")
+
+device = 'cuda'
+print(f"Using device: {device}")
 model = FP4Net().to(device)
+
+# Quantize weights after moving to GPU
+model.fc1.quantize_weights()
+model.fc2.quantize_weights()
 
 # Test forward pass
 batch = torch.randn(32, 784, device=device)
