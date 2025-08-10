@@ -17,6 +17,9 @@ import os
 import pickle
 warnings.filterwarnings('ignore')
 
+# Fix tokenizer parallelism warning
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 def set_seed(seed: int = 42):
     """Set all random seeds for reproducibility"""
     random.seed(seed)
@@ -35,11 +38,11 @@ class ModelConfig:
     n_layers: int = 6
     d_ff: int = 1536
     batch_size: int = 24
-    max_steps: int = 5000
+    max_steps: int = 1000
 
     # Training parameters
     gradient_accumulation_steps: int = 4
-    muon_lr: float = 0.01
+    adamw_lr: float = 0.001
 
     # Data parameters
     max_seq_len: int = 512
@@ -63,52 +66,7 @@ class ModelConfig:
         self.d_k = self.d_model // self.n_heads
         assert self.d_model % self.n_heads == 0, "d_model must be divisible by n_heads"
 
-@torch.compile
-def zeropower_via_newtonschulz5(G: torch.Tensor, steps: int = 5) -> torch.Tensor:
-    """Newton-Schulz iteration to compute the zeroth power / orthogonalization of G."""
-    assert G.ndim >= 2
-    a, b, c = (3.4445, -4.7750, 2.0315)
-    X = G.bfloat16()
 
-    if G.size(-2) > G.size(-1):
-        X = X.mT
-
-    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
-
-    for _ in range(steps):
-        A = X @ X.mT
-        B = b * A + c * A @ A
-        X = a * X + B @ X
-
-    if G.size(-2) > G.size(-1):
-        X = X.mT
-
-    return X
-
-class Muon(torch.optim.Optimizer):
-    """Muon - MomentUm Orthogonalized by Newton-schulz"""
-    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5):
-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
-        super().__init__(params, defaults)
-
-    @torch.no_grad()
-    def step(self):
-        for group in self.param_groups:
-            for p in group["params"]:
-                if p.grad is None:
-                    continue
-
-                g = p.grad
-                state = self.state[p]
-
-                if "momentum_buffer" not in state:
-                    state["momentum_buffer"] = torch.zeros_like(g)
-
-                buf = state["momentum_buffer"]
-                buf.lerp_(g, 1 - group["momentum"])
-                g = g.lerp_(buf, group["momentum"]) if group["nesterov"] else buf
-                g = zeropower_via_newtonschulz5(g, steps=group["ns_steps"])
-                p.add_(g.view_as(p), alpha=-group["lr"] * max(1, p.size(-2) / p.size(-1))**0.5)
 	
 def load_and_cache_data(config: ModelConfig, cache_dir: str = "data_cache"):
     """Load and cache tokenized data to avoid reprocessing"""
@@ -325,31 +283,24 @@ def evaluate_model(model: nn.Module, val_loader: DataLoader, config: ModelConfig
     model.train()
     return {'val_loss': avg_loss, 'val_accuracy': accuracy, 'val_perplexity': perplexity}
 
-def setup_muon_optimizer(model: nn.Module, config: ModelConfig):
-    """Setup Muon optimizer with hybrid approach"""
-    muon_params = []
-    adamw_params = []
+def setup_adamw_optimizer(model: nn.Module, config: ModelConfig):
+    """Setup AdamW optimizer for all parameters"""
+    all_params = [p for p in model.parameters() if p.requires_grad]
+    
+    print(f"  Total parameters: {sum(p.numel() for p in all_params):,}")
+    print(f"  Using AdamW with lr={config.adamw_lr:.4f} for all parameters")
 
-    for name, param in model.named_parameters():
-        if (param.ndim == 2 and 
-            'token_embedding' not in name and 
-            'norm' not in name and 
-            param.requires_grad):
-            muon_params.append(param)
-        else:
-            adamw_params.append(param)
-
-    print(f"  Muon parameters: {sum(p.numel() for p in muon_params):,}")
-    print(f"  AdamW parameters: {sum(p.numel() for p in adamw_params):,}")
-
-    muon_optimizer = Muon(muon_params, lr=config.muon_lr, momentum=0.95)
-    adamw_optimizer = torch.optim.AdamW(adamw_params, lr=config.muon_lr*0.1, weight_decay=config.weight_decay)
-
-    return [muon_optimizer, adamw_optimizer]
+    optimizer = torch.optim.AdamW(
+        all_params, 
+        lr=config.adamw_lr, 
+        weight_decay=config.weight_decay
+    )
+    
+    return optimizer
 
 def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataLoader):
-    """Train the model with Muon optimizer"""
-    print(f"\n🚀 Training Small model with Muon optimizer")
+    """Train the model with AdamW optimizer"""
+    print(f"\n🚀 Training Small model with AdamW optimizer")
 
     # Initialize model
     set_seed(42)
@@ -360,22 +311,19 @@ def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataL
     total_params = sum(p.numel() for p in model.parameters())
     print(f"  📊 Total parameters: {total_params:,}")
 
-    # Setup optimizers
-    optimizers = setup_muon_optimizer(model, config)
+    # Setup optimizer
+    optimizer = setup_adamw_optimizer(model, config)
 
     # Learning rate schedule
-    schedulers = []
-    for optimizer in optimizers:
-        warmup_steps = config.max_steps // 20
-        def lr_lambda(step):
-            if step < warmup_steps:
-                return step / warmup_steps
-            else:
-                progress = (step - warmup_steps) / (config.max_steps - warmup_steps)
-                return 0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * progress))
+    warmup_steps = config.max_steps // 20
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return step / warmup_steps
+        else:
+            progress = (step - warmup_steps) / (config.max_steps - warmup_steps)
+            return 0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * progress))
 
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-        schedulers.append(scheduler)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     scaler = GradScaler() if config.use_amp else None
 
@@ -410,23 +358,27 @@ def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataL
             # Optimizer step after accumulation
             if (step + 1) % config.gradient_accumulation_steps == 0:
                 if config.use_amp:
-                    for optimizer in optimizers:
-                        scaler.unscale_(optimizer)
+                    # Unscale gradients
+                    scaler.unscale_(optimizer)
+                    
+                    # Clip gradients
                     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
 
-                    for optimizer in optimizers:
-                        scaler.step(optimizer)
-                        optimizer.zero_grad()
-                    for scheduler in schedulers:
-                        scheduler.step()
+                    # Step optimizer and clear gradients
+                    scaler.step(optimizer)
+                    optimizer.zero_grad()
+                    
+                    # Update scheduler
+                    scheduler.step()
+                    
+                    # Update scaler
                     scaler.update()
                 else:
+                    # Standard training without AMP
                     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
-                    for optimizer in optimizers:
-                        optimizer.step()
-                        optimizer.zero_grad()
-                    for scheduler in schedulers:
-                        scheduler.step()
+                    optimizer.step()
+                    optimizer.zero_grad()
+                    scheduler.step()
 
             # Logging
             if step % 100 == 0:
@@ -440,7 +392,7 @@ def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataL
                     'loss': f'{current_loss:.4f}',
                     'acc': f'{accuracy:.3f}',
                     'ppl': f'{perplexity:.1f}',
-                    'lr': f'{optimizers[0].param_groups[0]["lr"]:.2e}'
+                    'lr': f'{optimizer.param_groups[0]["lr"]:.2e}'
                 })
 
             # Evaluation
